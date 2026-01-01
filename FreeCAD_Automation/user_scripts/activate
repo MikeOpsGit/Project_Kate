@@ -1,0 +1,106 @@
+#!/bin/bash
+# ==============================================================================================
+#                                       Script Overview
+# ==============================================================================================
+# Source this file to activate GitCAD workflow for this terminal session
+# Usage: source FreeCAD_Automation/user_scripts/activate
+
+# ==============================================================================================
+#                                       Constant Globals
+# ==============================================================================================
+SUCCESS=0
+FAIL=1
+TRUE=0
+FALSE=1
+GitCAD_Prompt="(GitCAD)"
+
+# ==============================================================================================
+#                                 Register Deactivate Function
+# ==============================================================================================
+deactivate_GitCAD() {
+    # Remove deactivate_GitCAD EXIT callback
+    trap - EXIT
+
+    # Remove the deactivate_GitCAD function definition (this function cannot be called anymore unless redefined)
+    if [ ! "$1" = "--keep-function-definition" ]; then
+        unset -f deactivate_GitCAD
+    fi
+    
+    # Restore original PATH
+    PATH="${PATH#$GIT_WRAPPER_PATH:}"      # Remove $GIT_WRAPPER_PATH (if found) from beginning of $PATH
+    PATH="${PATH%:$GIT_WRAPPER_PATH}"      # Remove $GIT_WRAPPER_PATH (if found) from end of $PATH
+    PATH="${PATH//:$GIT_WRAPPER_PATH:/:}"  # Remove $GIT_WRAPPER_PATH (if found) from middle of $PATH
+    export PATH
+    
+    # Unset environment variables
+    unset GITCAD_REPO_ROOT
+    unset REAL_GIT
+    unset GITCAD_ACTIVATED
+    unset GIT_WRAPPER_PATH
+    
+    # Remove `(GitCAD)` from PS1 prompt
+    if [ -n "$PS1" ]; then
+        PS1="${PS1//"$GitCAD_Prompt "/}"
+    fi
+    
+    echo "GitCAD git wrapper deactivated"
+}
+
+trap 'deactivate_GitCAD' EXIT
+
+# ==============================================================================================
+#                                  Prevent Infinite Recursion
+# ==============================================================================================
+if [ "$GITCAD_ACTIVATED" = "$TRUE" ]; then
+    deactivate_GitCAD --keep-function-definition
+fi
+
+# ==============================================================================================
+#                               Verify and Retrieve Dependencies
+# ==============================================================================================
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Error: User did not source this script correctly" >&2
+    exit $FAIL
+fi
+
+# Check if inside a Git repository
+if ! GIT_COMMAND="rev-parse" git rev-parse --git-dir > /dev/null; then
+    echo "Error: Not inside a Git repository" >&2
+    return $FAIL
+fi
+
+# Store the repository root
+if [[ "${OSTYPE^^}" == "CYGWIN"* || "${OSTYPE^^}" == "MSYS"* || "${OSTYPE^^}" == "MINGW"* ]]; then
+    gitcad_repo_root="$(GIT_COMMAND="rev-parse" git rev-parse --show-toplevel 2>/dev/null)"
+    export GITCAD_REPO_ROOT="$(echo "$gitcad_repo_root" | sed -E 's#^([A-Za-z]):/#/\L\1/#')" # Note: Convert drive letters IE `D:/` to `/d/`
+else
+    export GITCAD_REPO_ROOT="$(GIT_COMMAND="rev-parse" git rev-parse --show-toplevel 2>/dev/null)"
+fi
+
+if [ -z "$GITCAD_REPO_ROOT" ]; then
+    echo "Error: Not in a git repository" >&2
+    return $FAIL
+fi
+
+# ==============================================================================================
+#         Add Wrapper Script to PATH Environment Variable, Ahead Of The Real `git.exe`
+# ==============================================================================================
+# Note: Used by FreeCAD_Automation/git to call the appropriate git executable.
+export REAL_GIT="$(command -v git)"
+
+# Add git wrapper script to PATH Environment variable
+export GITCAD_ACTIVATED="$TRUE"
+export GIT_WRAPPER_PATH="$GITCAD_REPO_ROOT/FreeCAD_Automation"
+export PATH="$GIT_WRAPPER_PATH:$PATH"
+
+# Add $GitCAD_Prompt (GitCAD) to terminal prompt to note activation.
+if [ -n "$PS1" ] && [[ "$PS1" != *"$GitCAD_Prompt"* ]]; then
+    PS1="$GitCAD_Prompt $PS1"
+fi
+
+echo "=============================================================================================="
+echo "GitCAD git wrapper activated for this terminal session"
+echo "Repository: $GITCAD_REPO_ROOT"
+echo 
+echo "Use 'deactivate_GitCAD' to exit this environment."
+echo "=============================================================================================="

@@ -1,0 +1,514 @@
+#!/bin/bash
+# ==============================================================================================
+#                                       Constant Globals
+# ==============================================================================================
+SUCCESS=0
+FAIL=1
+TRUE=0
+FALSE=1
+# ==============================================================================================
+
+# Check if inside a Git repository, ensure pwd is root of repository
+git_repo_root_path="$(GIT_COMMAND="rev-parse" git rev-parse --show-toplevel)"
+if [ "$?" = "$SUCCESS" ]; then
+    cd "$git_repo_root_path"
+else 
+    echo "Error: Cannot find git repo root dir. Make sure pwd is inside the git repo when calling this script." >&2
+    exit $FAIL
+fi
+
+HOOKS=("post-checkout" "post-commit" "post-merge" "post-rewrite" "pre-commit" "pre-push") # Note: This array is used again in the `Setup Git Hooks` section
+USER_SCRIPTS=("activate" "init-repo")
+
+if [[ "${OSTYPE^^}" == "LINUX-GNU"* ]]; then
+    echo "=============================================================================================="
+    echo "                                    Set Linux Permissions"
+    echo "=============================================================================================="
+    
+    if ! find ./FreeCAD_Automation -name "*.sh" -type f -exec chmod 755 {} \; 2>/dev/null; then
+        echo "Error: Permission denied for chmod on scripts. Please run this script with sudo." >&2
+        exit $FAIL
+    fi
+
+    # Make git wrapper executable
+    if ! chmod 755 "FreeCAD_Automation/git" 2>/dev/null; then
+        echo "Error: Permission denied for chmod on git wrapper. Please run this script with sudo." >&2
+        exit $FAIL
+    fi
+
+    for hook in "${HOOKS[@]}"; do
+        if ! chmod 755 "FreeCAD_Automation/hooks/$hook" 2>/dev/null; then
+            echo "Error: Permission denied for chmod on hooks. Please run this script with sudo." >&2
+            exit $FAIL
+        fi
+    done
+
+    for script in "${USER_SCRIPTS[@]}"; do
+        if ! chmod 755 "FreeCAD_Automation/user_scripts/$script" 2>/dev/null; then
+            echo "Error: Permission denied for chmod on '$script'." >&2
+            echo "       Please run this script with sudo." >&2
+            exit $FAIL
+        fi
+    done
+    
+    echo "All bash scripts and hooks made executable."
+
+    if [ -n "$SUDO_USER" ]; then
+        OWNER="$SUDO_USER"
+    else
+        OWNER="$(whoami)"
+    fi
+
+    if ! chown -R "$OWNER":"$OWNER" "$(pwd)"; then
+        echo "Error: Permission denied for chown. Please run this script with sudo." >&2
+        exit $FAIL
+    fi
+    echo "Given ownership of all files to user."
+
+elif [[ "${OSTYPE^^}" == "CYGWIN"* || "${OSTYPE^^}" == "MSYS"* || "${OSTYPE^^}" == "MINGW"* ]]; then
+    echo "=============================================================================================="
+    echo "                                   Set Windows Permissions"
+    echo "=============================================================================================="
+    if ! powershell.exe -Command 'Get-ChildItem -Path ".\FreeCAD_Automation" -Recurse | Unblock-File'; then
+        echo "Error: Couldn't unblock scripts!" >&2
+        exit $FAIL
+    fi
+    echo "Unblocked all files in '.\FreeCAD_Automation'."
+fi
+
+echo "=============================================================================================="
+echo "                                    Create Config File"
+echo "=============================================================================================="
+DEFAULT_CONFIG=$(cat <<EOF
+{
+    "freecad-python-instance-path": "",
+
+    "require-lock-to-modify-FreeCAD-files": true,
+
+    "require-GitCAD-activation": true,
+    
+    "include-thumbnails": true,
+
+    "uncompressed-directory-structure": {
+        "uncompressed-directory-suffix": "_FCStd",
+        "uncompressed-directory-prefix": "",
+        "subdirectory": {
+            "put-uncompressed-directory-in-subdirectory": true,
+            "subdirectory-name": "uncompressed"
+        }
+    },
+
+    "compress-non-human-readable-FreeCAD-files": {
+        "enabled": true,
+        "files-to-compress": ["**/no_extension/*", "*.brp", "**/thumbnails/*", "*.Map.*", "*.Table.*"],
+        "max-compressed-file-size-gigabyte": 2,
+        "compression-level": 9,
+        "zip-file-prefix": "compressed_binaries_"
+    }
+}
+EOF
+)
+
+if [ ! -f "FreeCAD_Automation/config.json" ]; then
+    echo "$DEFAULT_CONFIG" > "FreeCAD_Automation/config.json"
+    echo "Created config file: FreeCAD_Automation/config.json" >&2
+    echo >&2
+    echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> USER ACTION REQUESTED <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<" >&2
+    echo "1. Please define 'freecad-python-instance-path' key in config.json" >&2
+    echo "2. Then Re-Run This Script" >&2
+    exit $FAIL
+fi
+
+echo "Config already exists."
+
+echo "=============================================================================================="
+echo "                             Verify and Retrieve Dependencies"
+echo "=============================================================================================="
+# Check git user.name and user.email set
+if ! GIT_COMMAND="config" git config --get user.name > /dev/null || ! git config --get user.email > /dev/null; then
+    echo "Error: git config user.name or user.email not set!" >&2
+    exit $FAIL
+fi
+
+# Check if git-lfs is installed
+if ! command -v git-lfs >/dev/null; then
+    echo "Error: git-lfs is not installed" >&2
+    exit $FAIL
+fi
+echo "git-lfs is installed"
+
+GIT_ROOT="$(GIT_COMMAND="rev-parse" git rev-parse --show-toplevel)"
+cd "$GIT_ROOT"
+
+# Import code used in this script
+FUNCTIONS_FILE="FreeCAD_Automation/utils.sh"
+source "$FUNCTIONS_FILE" --ignore-GitCAD-activation
+
+# Extract Python path
+echo "Extracted Python path: $PYTHON_PATH"
+
+# Check if Python runs correctly
+if "$PYTHON_PATH" --version > /dev/null; then
+    echo "Python runs correctly"
+else
+    echo "Error: Python does not run or path is invalid" >&2
+    exit $FAIL
+fi
+
+# Check if the import works
+if "$PYTHON_EXEC" -c "from freecad import project_utility as PU; print('Import successful')" > /dev/null; then
+    echo "FreeCAD Python library import successful"
+else
+    echo "Error: Import 'from freecad import project_utility as PU' failed" >&2
+    exit $FAIL
+fi
+
+echo "All checks passed"
+echo "=============================================================================================="
+echo "                                    Setup .gitignore"
+echo "=============================================================================================="
+add_to_gitignore() {
+    local ignore_target="$1"
+    if [ -f .gitignore ]; then
+        if ! grep -q -- "^$ignore_target$" .gitignore; then
+            # Ensure .gitignore ends with a newline before appending
+            if [ -s .gitignore ] && [ "$(tail -c1 .gitignore)" != $'\n' ]; then
+                echo >> .gitignore
+            fi
+            echo "$ignore_target" >> .gitignore
+            echo "Added $ignore_target to .gitignore"
+        else
+            echo "$ignore_target already in .gitignore"
+        fi
+    else
+        echo "$ignore_target" > .gitignore
+        echo "Created .gitignore and added $ignore_target"
+    fi
+}
+
+add_to_gitignore "**/__pycache__"
+add_to_gitignore "FreeCAD_Automation/config.json"
+add_to_gitignore "*.FCBak"
+add_to_gitignore ".fcmod"
+
+echo "=============================================================================================="
+echo "                                     Setup Git Hooks"
+echo "=============================================================================================="
+# Setup Git hooks
+HOOKS_DIR=".git/hooks"
+if [ ! -d "$HOOKS_DIR" ]; then
+    echo "Error: .git/hooks directory not found" >&2
+    exit $FAIL
+fi
+
+if [ ! -d "FreeCAD_Automation/hooks" ]; then
+    echo "Error: FreeCAD_Automation/hooks directory not found" >&2
+    exit $FAIL
+fi
+
+# Note: `HOOKS` array is defined in the `Make all bash scripts executable` section at the top of this script
+for hook in "${HOOKS[@]}"; do
+    if [ -f "$HOOKS_DIR/$hook" ]; then
+        echo "Hook $hook already exists in $HOOKS_DIR"
+        read -p "  - Do you want to overwrite it? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            cp "FreeCAD_Automation/hooks/$hook" "$HOOKS_DIR/$hook"
+            chmod +x "$HOOKS_DIR/$hook"
+            echo "    Installed $hook hook"
+            echo
+        else
+            echo "    Skipping $hook"
+            echo
+        fi
+    else
+        cp "FreeCAD_Automation/hooks/$hook" "$HOOKS_DIR/$hook"
+        chmod +x "$HOOKS_DIR/$hook"
+        echo "Installed $hook hook"
+        echo
+    fi
+done
+
+echo "=============================================================================================="
+echo "                                   Initializing Git-LFS"
+echo "=============================================================================================="
+# Configure locksverify for .lockfile
+if [[ "${OSTYPE^^}" == "LINUX-GNU"* ]]; then 
+    sudo -u "$OWNER" git config lfs.locksverify true
+
+else
+    GIT_COMMAND="config" git config lfs.locksverify true
+fi
+echo "Enabled git lfs locksverify for lockable files."
+
+GIT_COMMAND="lfs" git lfs track ".lockfile" --lockable
+GIT_COMMAND="lfs" git lfs track "*.zip"
+
+echo "=============================================================================================="
+echo "                                     Adding Filters"
+echo "=============================================================================================="
+setup_git_FCStd_filter() {
+    local filter_type="$1"
+    local desired_value="$2"
+    local purpose="$3"
+
+    CURRENT_VALUE="$(GIT_COMMAND="config" git config --get "filter.FCStd.$filter_type" 2>/dev/null)"
+
+    if [ -n "$CURRENT_VALUE" ]; then
+        if [ "$CURRENT_VALUE" = "$desired_value" ]; then
+            echo "filter.FCStd.$filter_type is already set to the desired value"
+            echo
+        else
+            echo "filter.FCStd.$filter_type already exists:"
+            echo "  - Permission to change \`$CURRENT_VALUE\` --> \`$desired_value\`?"
+            read -p "    (( $purpose ))  (y/n): " -n 1 -r
+            
+            echo
+            
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                if [[ "${OSTYPE^^}" == "LINUX-GNU"* ]]; then 
+                    sudo -u "$OWNER" git config "filter.FCStd.$filter_type" "$desired_value"
+                else
+                    GIT_COMMAND="config" git config "filter.FCStd.$filter_type" "$desired_value"
+                fi
+
+                echo "    Updated filter.FCStd.$filter_type"
+                echo
+            else
+                echo "    Skipping update of filter.FCStd.$filter_type"
+                echo
+            fi
+        fi
+    else
+        if [[ "${OSTYPE^^}" == "LINUX-GNU"* ]]; then 
+            sudo -u "$OWNER" git config "filter.FCStd.$filter_type" "$desired_value"
+        
+        else
+            GIT_COMMAND="config" git config "filter.FCStd.$filter_type" "$desired_value"
+        fi
+
+        echo "Set filter.FCStd.$filter_type"
+        echo
+    fi
+}
+
+# ! WARNING BELOW IS SOME VIBE SHIT THAT WILL DISTURB YOU.
+# I just didn't want to touch regex ;( I'll come back to it later if I care enough but all I know is
+# I have tested it against as many edge cases as I could find and it does what I expect it to.
+# Minimum Viable Product achieved!
+
+# If anyone comes back to refactor this, the objectives are as follows:
+    # 1. Ensure any *.fcstd (case insensitive) in .gitattributes has filter=FCStd
+    # 2. Ensure any *.[Ff][Cc][Ss][Tt][Dd] in .gitattributes has filter=FCStd
+    # 3. If no *.[Ff][Cc][Ss][Tt][Dd] exists, add one with filter=FCStd.
+
+    # Note for testing: test with multiple attributes
+        # IE
+            # Before: *.[Ff][Cc][Ss][Tt][Dd] diff=lfs filter=wrong merge=lfs
+            # After: *.[Ff][Cc][Ss][Tt][Dd] diff=lfs filter=FCStd merge=lfs
+setup_filter_gitattribute() {
+    local file_match="$1"
+    local filter_target="$2"
+    # The first argument is always treated as a regular expression.
+    # Use it directly for matching and derive a literal pattern for insertion.
+    local regex_pattern="$file_match"
+    # Derive a literal pattern by stripping the leading ^ (if present) and unescaping only \* and \.
+    local literal_pattern="${file_match#^}"
+    literal_pattern="$(printf '%s' "$literal_pattern" | sed -e 's/\\\*/\*/g' -e 's/\\\././g')"
+    # Normalize the known FCStd regex to the exact expected literal pattern to avoid any shell/glob side effects
+    if [[ "$file_match" == "^\*\.[Ff][Cc][Ss][Tt][Dd]" ]]; then
+        literal_pattern="*.[Ff][Cc][Ss][Tt][Dd]"
+    fi
+
+    # Process .gitattributes
+    if [ -f "$GITATTRIBUTES" ]; then
+        # Read the file into an array
+        mapfile -t lines < "$GITATTRIBUTES"
+        # Strip carriage returns from each line (handles CRLF line endings on Windows)
+        for i in "${!lines[@]}"; do
+            lines[$i]="${lines[$i]%$'\r'}"
+        done
+        updated=false
+        found=false
+        shopt -s nocasematch
+        for i in "${!lines[@]}"; do
+            line="${lines[$i]}"
+            # Check if line matches the regex variant OR starts with the canonical literal pattern
+            # This ensures we also update lines like "*.[Ff][Cc][Ss][Tt][Dd] filter=F2CStd1"
+            if [[ "$line" =~ $regex_pattern || "$line" == "$literal_pattern"* ]]; then
+                found=true
+                # Check for filter=
+                if [[ "$line" =~ filter=([^ ]*) ]]; then
+                    filter_value="${BASH_REMATCH[1]}"
+                    if [ -z "$filter_value" ]; then
+                        # Set to filter_target
+                        lines[$i]="${line} filter=$filter_target"
+                        updated=true
+                    elif [ "$filter_value" != "$filter_target" ]; then
+                        echo "$file_match has different filter in .gitattributes:"
+                        read -p "  - Permission to change \`filter=$filter_value\` --> \`filter=$filter_target\`? (y/n): " -n 1 -r
+                        echo
+                        if [[ $REPLY =~ ^[Yy]$ ]]; then
+                            # Replace the filter value
+                            lines[$i]=$(echo "$line" | sed "s/filter=[^ ]*/filter=$filter_target/")
+                            updated=true
+                            echo "    Updated .gitattributes for $file_match"
+                            echo
+                        else
+                            echo "    Skipping update of .gitattributes for $file_match"
+                            echo
+                        fi
+                    fi
+                else
+                    # No filter=, add it
+                    lines[$i]="$line filter=$filter_target"
+                    updated=true
+                fi
+            fi
+        done
+        shopt -u nocasematch
+        # Correct any previously mis-generated wildcard-only line (e.g., "* filter=FCStd")
+        for i in "${!lines[@]}"; do
+            if [[ "${lines[$i]}" == "* filter=$filter_target" ]]; then
+                lines[$i]="$literal_pattern filter=$filter_target"
+                updated=true
+                echo "Corrected misgenerated line: '* filter=$filter_target' -> '$literal_pattern filter=$filter_target'"
+                echo
+            fi
+        done
+
+        # Ensure presence of a canonical entry without creating duplicates:
+        # If any line that starts with the literal pattern already contains filter=$filter_target,
+        # do not add another minimal canonical line.
+        has_canonical=false
+        for i in "${!lines[@]}"; do
+            if [[ "${lines[$i]}" == "$literal_pattern"* ]] && [[ "${lines[$i]}" == *"filter=$filter_target"* ]]; then
+                has_canonical=true
+                break
+            fi
+        done
+        if [ "$has_canonical" = false ]; then
+            lines+=("$literal_pattern filter=$filter_target")
+            updated=true
+            echo "Added canonical pattern: $literal_pattern filter=$filter_target to .gitattributes"
+            echo
+        fi
+        if [ "$updated" = true ]; then
+            # Write back to file
+            printf '%s\n' "${lines[@]}" > "$GITATTRIBUTES"
+        fi
+    else
+        # If no .gitattributes, create it with the literal pattern line
+        echo "$literal_pattern filter=$filter_target" > "$GITATTRIBUTES"
+        echo "Added $literal_pattern filter=$filter_target to .gitattributes"
+        echo
+    fi
+}
+
+# Add FCStd filters
+setup_git_FCStd_filter "clean" "./FreeCAD_Automation/FCStd-clean-filter.sh %f" "This makes git see .FCStd files as being empty and decompresses added .FCStd files"
+setup_git_FCStd_filter "smudge" "cat" "Disabled smudge filter" # Required requires both clean and smudge be defined else it will always error out.
+setup_git_FCStd_filter "required" "true" "If clean/smudge filter fails, undo add operation."
+
+# Check .gitattributes for *.FCStd filter
+GITATTRIBUTES=".gitattributes"
+if [ ! -f "$GITATTRIBUTES" ]; then
+    touch "$GITATTRIBUTES"
+    echo "Created .gitattributes"
+fi
+
+# Setup filters for .gitattributes
+setup_filter_gitattribute "^\*\.[Ff][Cc][Ss][Tt][Dd]" "FCStd"
+
+echo "=============================================================================================="
+echo "                                     Adding git aliases"
+echo "=============================================================================================="
+setup_git_alias() {
+    local alias="$1"
+    local desired_value="$2"
+    local purpose="$3"
+
+    CURRENT_VALUE="$(GIT_COMMAND="config" git config --get "alias.$alias" 2>/dev/null)"
+
+    if [ -n "$CURRENT_VALUE" ]; then
+        if [ "$CURRENT_VALUE" = "$desired_value" ]; then
+            echo "alias.$alias is already set to the desired value"
+            echo
+        else
+            echo "alias.$alias already exists:"
+            echo "  - Permission to change \`$CURRENT_VALUE\` --> \`$desired_value\`?"
+            read -p "    (( $purpose ))  (y/n): " -n 1 -r
+            
+            echo
+            
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                if [[ "${OSTYPE^^}" == "LINUX-GNU"* ]]; then 
+                    sudo -u "$OWNER" git config "alias.$alias" "$desired_value"
+                
+                else
+                    GIT_COMMAND="config" git config "alias.$alias" "$desired_value"
+                fi
+
+                echo "    Updated alias.$alias"
+                echo
+            else
+                echo "    Skipping update of alias.$alias"
+                echo
+            fi
+        fi
+    else
+        if [[ "${OSTYPE^^}" == "LINUX-GNU"* ]]; then 
+            sudo -u "$OWNER" git config "alias.$alias" "$desired_value"
+        
+        else
+            GIT_COMMAND="config" git config "alias.$alias" "$desired_value"
+        fi
+        echo "Set alias.$alias"
+        echo
+    fi
+}
+
+setup_git_alias "fcmod" "!bash FreeCAD_Automation/git_aliases/clear-FCStd-modification.sh \"\${GIT_PREFIX}\"" "Clears passed FCStd file modification making git think it's empty."
+setup_git_alias "fadd" "!GIT_COMMAND=\"add\" git add" "Allows FCStd clean filter to export \`.FCStd\` files."
+# setup_git_alias "stat" "!GIT_COMMAND=\"status\" git status" "Lets clean filter know that status call triggered it, leave .FCStd files untouched and don't clear their modification flag." # Note: See note in *) case of clear-FCStd-modification.sh for more information.
+setup_git_alias "fco" "!bash FreeCAD_Automation/git_aliases/checkout-FCStd-files.sh \"\${GIT_PREFIX}\"" "Adds \`git fco\` as alias to run checkout-FCStd-files.sh"
+setup_git_alias "lock" "!bash FreeCAD_Automation/git_aliases/lock.sh \"\${GIT_PREFIX}\"" "Adds \`git lock\` as alias to run lock.sh"
+setup_git_alias "unlock" "!bash FreeCAD_Automation/git_aliases/unlock.sh \"\${GIT_PREFIX}\"" "Adds \`git unlock\` as alias to run unlock.sh"
+setup_git_alias "locks" "lfs locks" "1 to 1 alias for \`git lfs locks\`"
+setup_git_alias "ftool" "!bash FreeCAD_Automation/git_aliases/FCStd-file-tool.sh \"\${GIT_PREFIX}\"" "Adds \`git ftool\` as alias to run FCStdFileTool.py"
+setup_git_alias "fimport" "!bash FreeCAD_Automation/git_aliases/FCStd-file-tool.sh \"\${GIT_PREFIX}\" --fimport" "Adds \`git fimport\` as alias to run FCStdFileTool.py with preset import args"
+setup_git_alias "fexport" "!bash FreeCAD_Automation/git_aliases/FCStd-file-tool.sh \"\${GIT_PREFIX}\" --fexport" "Adds \`git fexport\` as alias to run FCStdFileTool.py with preset export args"
+setup_git_alias "fstash" "!bash FreeCAD_Automation/git_aliases/git-stash-and-sync-FCStd-files.sh \"\${GIT_PREFIX}\"" "Adds \`git fstash\` as alias to run git-stash-and-sync-FCStd-files.sh"
+setup_git_alias "freset" "!bash FreeCAD_Automation/git_aliases/git-reset-and-sync-FCStd-files.sh" "Adds \`git freset\` as alias to run git-reset-and-sync-FCStd-files.sh"
+
+echo "=============================================================================================="
+echo "                               Synchronizing \`.FCStd\` Files"
+echo "=============================================================================================="
+FCStd_file_paths="$(GIT_COMMAND="ls-files" git ls-files | grep -i -- '\.fcstd$')"
+
+if [ -n "$FCStd_file_paths" ]; then
+    echo "Do you want to import data from all uncompressed FreeCAD dirs to their respective \`.FCStd\` files?: "
+    read -p "(( initialize \`.FCStd\` file ↔ uncompressed dir synchronization ))  (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        mapfile -t FCStd_file_paths <<<"$FCStd_file_paths"
+        for FCStd_file_path in "${FCStd_file_paths[@]}"; do
+            [ -z "$FCStd_file_path" ] && continue
+            
+            echo -n "IMPORTING: '$FCStd_file_path'...."
+            # Import data to FCStd file
+            "$PYTHON_EXEC" "$FCStdFileTool" --SILENT --CONFIG-FILE --import "$FCStd_file_path" || {
+                echo >&2
+                echo "ERROR: Failed to import '$FCStd_file_path', skipping..." >&2
+                continue
+            }
+            
+            echo "SUCCESS"
+            GIT_COMMAND="fcmod" git fcmod "$FCStd_file_path"
+        done
+    fi
+
+else
+    echo "Nothing to synchronize."
+fi
+exit $SUCCESS

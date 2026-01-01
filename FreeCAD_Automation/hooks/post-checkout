@@ -1,0 +1,139 @@
+#!/bin/bash
+# echo "DEBUG: ============== post-checkout hook trap-card triggered! ==============" >&2
+# ==============================================================================================
+#                                         GIT LFS Hooks
+# ==============================================================================================
+command -v git-lfs >/dev/null 2>&1 || { echo >&2 "\nThis repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'post-checkout' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks').\n"; exit 2; }
+
+git lfs post-checkout "$@"
+# ==============================================================================================
+#                               Verify and Retrieve Dependencies
+# ==============================================================================================
+# Import code used in this script
+FUNCTIONS_FILE="FreeCAD_Automation/utils.sh"
+source "$FUNCTIONS_FILE"
+
+if [ -z "$PYTHON_PATH" ] || [ -z "$REQUIRE_LOCKS" ]; then
+    echo "Error: Config file missing or invalid; cannot proceed." >&2
+    exit $FAIL
+fi
+
+# ==============================================================================================
+#                                      Pull LFS files
+# ==============================================================================================
+GIT_COMMAND="lfs" git lfs pull
+# echo "DEBUG: Pulled lfs files" >&2
+
+# ==============================================================================================
+#                                  Handle Rebase Edge-case
+# ==============================================================================================
+# Note: Rebase logic handled by Post-Rewrite hook. If rebase detected (rebase-merge or rebase-apply dirs exit in .git), skip post-commit hook logic
+if [ -d "$(GIT_COMMAND="rev-parse" git rev-parse --git-path rebase-merge)" ] || [ -d "$(GIT_COMMAND="rev-parse" git rev-parse --git-path rebase-apply)" ]; then
+    # echo "DEBUG: Rebase detected, skipping post-checkout hook logic..." >&2
+    exit $SUCCESS
+
+# ==============================================================================================
+#                                    Branch Checkout Logic
+# ==============================================================================================
+# Note, Args: $1=old-head-sha $2=new-head-sha $3=checkout-type (1=branch, 0=file)
+elif [ "$3" = "1" ]; then
+    # echo "DEBUG: Processing Branch Checkout...." >&2
+
+    if [ "$REQUIRE_LOCKS" = "$TRUE" ]; then
+        CURRENT_USER="$(GIT_COMMAND="config" git config --get user.name)" || {
+            echo "Error: git config user.name not set!" >&2
+            exit $FAIL
+        }
+
+        mapfile -t CURRENT_LOCKS < <(
+            GIT_COMMAND="lfs" git lfs locks |
+            awk -v user="$CURRENT_USER" '
+                match($0, /^(.*)[[:space:]]+([^[:space:]]+)[[:space:]]+ID:[0-9]+$/, m) &&
+                m[2] == user {
+                    gsub(/[[:space:]]+$/, "", m[1])
+                    print m[1]
+                }
+            '
+        ) || {
+            echo "Error: failed to list of active lock info." >&2
+            exit $FAIL
+        }
+    fi
+
+    # echo "DEBUG: diffing <remote sha1>='$1'..'$2'=<local sha1>" >&2
+    changed_files="$(GIT_COMMAND="diff-tree" git diff-tree --no-commit-id --name-only -r "$1" "$2")"
+
+    # Get changed `.changefile`s
+    changefiles_changed_between_commits="$(printf '%s\n' "$changed_files" | grep -i -- '\.changefile$')"
+
+    # echo -e "\nDEBUG: checking changed changefiles: '$(echo "$changefiles_changed_between_commits" | xargs)'" >&2
+
+    mapfile -t changefiles_changed_between_commits <<<"$changefiles_changed_between_commits"
+    for changefile in "${changefiles_changed_between_commits[@]}"; do
+        [ -z "$changefile" ] && continue
+        
+        # echo -e "\nDEBUG: checking '$changefile'....$(grep -F -- 'File Last Exported On:' "$changefile")" >&2
+
+        FCStd_file_path="$(get_FCStd_file_from_changefile "$changefile")" || continue
+
+        echo -n "IMPORTING: '$FCStd_file_path'...." >&2
+        
+        # Import data to FCStd file
+        "$PYTHON_EXEC" "$FCStdFileTool" --SILENT --CONFIG-FILE --import "$FCStd_file_path" || {
+            echo >&2
+            echo "ERROR: Failed to import '$FCStd_file_path', skipping..." >&2
+            continue
+        }
+        
+        echo "SUCCESS" >&2
+
+        GIT_COMMAND="fcmod" git fcmod "$FCStd_file_path"
+
+        FCStd_dir_path="$(dirname "$changefile")"
+        lockfile="$FCStd_dir_path/.lockfile"
+
+        if [ "$REQUIRE_LOCKS" = "$TRUE" ]; then
+            if printf '%s\n' "${CURRENT_LOCKS[@]}" | grep -Fxq -- "$lockfile"; then
+                # User has lock, set .FCStd file to writable
+                make_writable "$FCStd_file_path"
+                # echo "DEBUG: set '$FCStd_file_path' writable." >&2
+            else
+                # User doesn't have lock, set .FCStd file to readonly
+                make_readonly "$FCStd_file_path"
+                # echo "DEBUG: set '$FCStd_file_path' readonly." >&2
+            fi
+        fi
+    done
+
+# ==============================================================================================
+#                                      File Checkout Logic
+# ==============================================================================================
+# Note, Args: $1=old-head-sha $2=new-head-sha $3=checkout-type (1=branch, 0=file)
+# Note: GitCAD wapper logic is the same as fco alias logic in checkout-FCStd-files.sh.
+    # The reason I don't simply call the alias is because the alias doesn't work with non-FCStd files.
+    # This implementation will also work with non-FCStd files, it just tacs on FCStd checkout logic.
+    
+    # Even if non-FCStd file logic was implemented for git fco, the environments are different enough I don't mind having duplicate code.
+elif [ "$3" = "0" ]; then
+    # echo "DEBUG: Processing File Checkout...." >&2
+    
+    # >>>>>>>>>>>>>>>>>>> Prevent Infinite Loop With GitCAD Activated <<<<<<<<<<<<<<<<<<<
+    if [ -n "$FILE_CHECKOUT_IN_PROGRESS" ]; then
+        # echo "DEBUG: File checkout in progress, skipping..." >&2
+        :
+
+    else
+        # GitCAD not activated or no checkout info available
+        echo "WARNING: File checkout detected, for .FCStd files either activate GitCAD and try again or use \`git fco\` instead!" >&2
+        :
+    fi
+
+# ==============================================================================================
+#                                      Other Checkout Type
+# ==============================================================================================
+else
+    # Unknown checkout type
+    echo "Unknown checkout type: $3, skipping \`.FCStd\` processing..." >&2
+fi
+
+exit $SUCCESS

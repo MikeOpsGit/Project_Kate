@@ -1,1 +1,4 @@
 *.FCBak
+**/__pycache__
+FreeCAD_Automation/config.json
+.fcmod

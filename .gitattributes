@@ -1,2 +1,8 @@
-*.FCStd filter=lfs diff=lfs merge=lfs -text lockable
 *.jpg filter=lfs diff=lfs merge=lfs -text
+.lockfile filter=lfs diff=lfs merge=lfs -text lockable
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.[Ff][Cc][Ss][Tt][Dd] filter=FCStd
+**/no_extension/* filter=lfs diff=lfs merge=lfs -text
+*.brp filter=lfs diff=lfs merge=lfs -text
+*.Map.* filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text

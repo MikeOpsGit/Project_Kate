@@ -1,0 +1,102 @@
+#!/bin/bash
+# echo "DEBUG: ============== post-merge hook trap-card triggered! ==============" >&2
+# ==============================================================================================
+#                                       Script Overview
+# ==============================================================================================
+# Post-merge hook for Git. Runs Git LFS post-merge, pulls LFS files, and updates/synchronizes changed .FCStd files with uncompressed data.
+# Ensures .FCStd files are set to readonly or writable based on lock status if locking is required.
+
+# ==============================================================================================
+#                                         GIT LFS Hooks
+# ==============================================================================================
+command -v git-lfs >/dev/null 2>&1 || { echo >&2 "\nThis repository is configured for Git LFS but 'git-lfs' was not found on your path. If you no longer wish to use Git LFS, remove this hook by deleting the 'post-merge' file in the hooks directory (set by 'core.hookspath'; usually '.git/hooks').\n"; exit 2; }
+
+git lfs post-merge "$@"
+# ==============================================================================================
+#                               Verify and Retrieve Dependencies
+# ==============================================================================================
+# Import code used in this script
+FUNCTIONS_FILE="FreeCAD_Automation/utils.sh"
+source "$FUNCTIONS_FILE"
+
+if [ -z "$PYTHON_PATH" ] || [ -z "$REQUIRE_LOCKS" ]; then
+    echo "Error: Config file missing or invalid; cannot proceed." >&2
+    exit $FAIL
+fi
+
+# ==============================================================================================
+#                                     Pull LFS files
+# ==============================================================================================
+GIT_COMMAND="lfs" git lfs pull
+# echo "DEBUG: Pulled lfs files" >&2
+
+# ==============================================================================================
+#                         Update .FCStd files with uncompressed files
+# ==============================================================================================
+if [ "$REQUIRE_LOCKS" = "$TRUE" ]; then
+    CURRENT_USER="$(GIT_COMMAND="config" git config --get user.name)" || {
+        echo "Error: git config user.name not set!" >&2
+        exit $FAIL
+    }
+
+    mapfile -t CURRENT_LOCKS < <(
+        GIT_COMMAND="lfs" git lfs locks |
+        awk -v user="$CURRENT_USER" '
+            match($0, /^(.*)[[:space:]]+([^[:space:]]+)[[:space:]]+ID:[0-9]+$/, m) &&
+            m[2] == user {
+                gsub(/[[:space:]]+$/, "", m[1])
+                print m[1]
+            }
+        '
+    ) || {
+        echo "Error: failed to list of active lock info." >&2
+        exit $FAIL
+    }
+fi
+
+# echo "DEBUG: diffing <remote sha1>='ORIG_HEAD'..'HEAD'=<local sha1>" >&2
+changed_files="$(GIT_COMMAND="diff-tree" git diff-tree --no-commit-id --name-only -r "ORIG_HEAD" "HEAD")"
+
+# Get changed `.changefile`s
+changed_changefiles="$(printf '%s\n' "$changed_files" | grep -i -- '\.changefile$')"
+
+# echo -e "\nDEBUG: checking changed changefiles: '$(echo "$changed_changefiles" | xargs)'" >&2
+
+mapfile -t changed_changefiles <<<"$changed_changefiles"
+for changefile in "${changed_changefiles[@]}"; do
+    [ -z "$changefile" ] && continue
+    
+    # echo -e "\nDEBUG: checking '$changefile'....$(grep 'File Last Exported On:' "$changefile")" >&2
+
+    FCStd_file_path="$(get_FCStd_file_from_changefile "$changefile")" || continue
+
+    echo -n "IMPORTING: '$FCStd_file_path'...." >&2
+
+    # Import data to FCStd file
+    "$PYTHON_EXEC" "$FCStdFileTool" --SILENT --CONFIG-FILE --import "$FCStd_file_path" || {
+        echo >&2
+        echo "ERROR: Failed to import '$FCStd_file_path', skipping..." >&2
+        continue
+    }
+
+    echo "SUCCESS" >&2
+
+    GIT_COMMAND="fcmod" git fcmod "$FCStd_file_path"
+
+    FCStd_dir_path="$(dirname "$changefile")"
+    lockfile="$FCStd_dir_path/.lockfile"
+
+    if [ "$REQUIRE_LOCKS" = "$TRUE" ]; then
+        if printf '%s\n' "${CURRENT_LOCKS[@]}" | grep -Fxq -- "$lockfile"; then
+            # User has lock, set .FCStd file to writable
+            make_writable "$FCStd_file_path"
+            # echo "DEBUG: set '$FCStd_file_path' writable." >&2
+        else
+            # User doesn't have lock, set .FCStd file to readonly
+            make_readonly "$FCStd_file_path"
+            # echo "DEBUG: set '$FCStd_file_path' readonly." >&2
+        fi
+    fi
+done
+
+exit $SUCCESS
