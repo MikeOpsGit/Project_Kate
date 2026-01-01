@@ -97,6 +97,8 @@ DEFAULT_CONFIG=$(cat <<EOF
             "subdirectory-name": "uncompressed"
         }
     },
+	
+	"some-new-config": "new value",
 
     "compress-non-human-readable-FreeCAD-files": {
         "enabled": true,
